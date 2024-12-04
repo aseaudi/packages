@@ -17,6 +17,27 @@ import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.exoplayer.source.MediaSource;
+import androidx.media3.common.util.Log;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.database.DatabaseProvider;
+import androidx.media3.database.StandaloneDatabaseProvider;
+import androidx.media3.datasource.DataSource;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.datasource.HttpEngineDataSource;
+import androidx.media3.datasource.cache.Cache;
+import androidx.media3.datasource.cache.CacheDataSink;
+import androidx.media3.datasource.cache.CacheDataSource;
+import androidx.media3.datasource.cache.NoOpCacheEvictor;
+import androidx.media3.datasource.cache.SimpleCache;
+// import androidx.media3.datasource.cronet.CronetDataSource;
+// import androidx.media3.datasource.cronet.CronetUtil;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
+import androidx.media3.exoplayer.RenderersFactory;
+import androidx.media3.exoplayer.offline.DownloadManager;
+import androidx.media3.exoplayer.offline.DownloadNotificationHelper;
+
+import java.io.File;
 import java.util.Map;
 
 final class HttpVideoAsset extends VideoAsset {
@@ -25,6 +46,9 @@ final class HttpVideoAsset extends VideoAsset {
 
   @NonNull private final StreamingFormat streamingFormat;
   @NonNull private final Map<String, String> httpHeaders;
+  private static DatabaseProvider databaseProvider;
+  private static Cache downloadCache;
+  private static File downloadDirectory;
 
   HttpVideoAsset(
       @Nullable String assetUrl,
@@ -79,9 +103,53 @@ final class HttpVideoAsset extends VideoAsset {
       userAgent = httpHeaders.get(HEADER_USER_AGENT);
     }
     unstableUpdateDataSourceFactory(initialFactory, httpHeaders, userAgent);
-    DataSource.Factory dataSourceFactory = new DefaultDataSource.Factory(context, initialFactory);
+    DataSource.Factory dataSourceFactory1 = new DefaultDataSource.Factory(context, initialFactory);
+    DataSource.Factory dataSourceFactory = buildReadOnlyCacheDataSource(dataSourceFactory1, getDownloadCache(context));
     return new DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory);
   }
+
+  private static synchronized Cache getDownloadCache(Context context) {
+    if (downloadCache == null) {
+      File downloadContentDirectory =
+          new File(getDownloadDirectory(context), "downloads");
+      downloadCache =
+          new SimpleCache(
+              downloadContentDirectory, new NoOpCacheEvictor(), getDatabaseProvider(context));
+    }
+    return downloadCache;
+  }
+
+  private static synchronized DatabaseProvider getDatabaseProvider(Context context) {
+    if (databaseProvider == null) {
+      databaseProvider = new StandaloneDatabaseProvider(context);
+    }
+    return databaseProvider;
+  }
+
+  private static synchronized File getDownloadDirectory(Context context) {
+    if (downloadDirectory == null) {
+      downloadDirectory = context.getExternalFilesDir(/* type= */ null);
+      if (downloadDirectory == null) {
+        downloadDirectory = context.getFilesDir();
+      }
+    }
+    return downloadDirectory;
+  }
+
+  private static CacheDataSource.Factory buildReadOnlyCacheDataSource(
+      DataSource.Factory upstreamFactory, Cache cache) {
+    return new CacheDataSource.Factory()
+        .setCache(cache)
+        .setUpstreamDataSourceFactory(upstreamFactory)
+        // .setCacheWriteDataSinkFactory(null)
+        .setCacheWriteDataSinkFactory(
+            new CacheDataSink.Factory()
+                .setCache(cache)
+                .setFragmentSize(CacheDataSink.DEFAULT_FRAGMENT_SIZE)
+        )
+        .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR);
+  }
+
 
   // TODO: Migrate to stable API, see https://github.com/flutter/flutter/issues/147039.
   @OptIn(markerClass = UnstableApi.class)
