@@ -303,6 +303,11 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   _player = [avFactory playerWithPlayerItem:item];
   _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
+  // set buffer to 3 seconds
+  NSTimeInterval interval = 1; // set to  0 for default duration.
+  _player.currentItem.preferredForwardBufferDuration = interval;
+  _player.automaticallyWaitsToMinimizeStalling = YES;
+
   // This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
   // (https://github.com/flutter/flutter/issues/111457) and 2. swapped width and height for some
   // video streams (not just iOS 16).  (https://github.com/flutter/flutter/issues/109116). An
