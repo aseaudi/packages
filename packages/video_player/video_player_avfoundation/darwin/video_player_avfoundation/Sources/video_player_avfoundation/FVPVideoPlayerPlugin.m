@@ -71,7 +71,7 @@
 
 #pragma mark -
 
-@interface FVPVideoPlayer ()
+@interface FVPVideoPlayer () <NSURLSessionDelegate, NSURLSessionDataDelegate, NSURLSessionTaskDelegate>
 @property(readonly, nonatomic) AVPlayerItemVideoOutput *videoOutput;
 // The plugin registrar, to obtain view information from.
 @property(nonatomic, weak) NSObject<FlutterPluginRegistrar> *registrar;
@@ -103,6 +103,8 @@
 @property NSUInteger contentLength;
 @property Float64 totalBufferedTime;
 @property NSURL *realURL;
+@property NSUInteger minBuffer;
+@property NSUInteger maxBuffer;
 
 - (instancetype)initWithURL:(NSURL *)url
                frameUpdater:(FVPFrameUpdater *)frameUpdater
@@ -120,6 +122,8 @@ static void *timeRangeContext = &timeRangeContext;
 static void *statusContext = &statusContext;
 static void *presentationSizeContext = &presentationSizeContext;
 static void *durationContext = &durationContext;
+static void *isPlaybackBufferEmptyContext = &isPlaybackBufferEmptyContext;
+static void *isPlaybackBufferFullContext = &isPlaybackBufferFullContext;
 static void *playbackLikelyToKeepUpContext = &playbackLikelyToKeepUpContext;
 static void *rateContext = &rateContext;
 
@@ -149,6 +153,10 @@ static void *rateContext = &rateContext;
   if (!_disposed) {
     [self removeKeyValueObservers];
   }
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self.session invalidateAndCancel];
+    self.session = nil;
+    
 }
 
 - (void)addObserversForItem:(AVPlayerItem *)item player:(AVPlayer *)player {
@@ -172,6 +180,15 @@ static void *rateContext = &rateContext;
          forKeyPath:@"playbackLikelyToKeepUp"
             options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew
             context:playbackLikelyToKeepUpContext];
+  [item addObserver:self
+         forKeyPath:@"isPlaybackBufferEmpty"
+            options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew
+            context:isPlaybackBufferEmptyContext];
+  [item addObserver:self
+         forKeyPath:@"isPlaybackBufferFull"
+            options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew
+            context:isPlaybackBufferFullContext];
+
 
   // Add observer to AVPlayer instead of AVPlayerItem since the AVPlayerItem does not have a "rate"
   // property
@@ -184,7 +201,19 @@ static void *rateContext = &rateContext;
   [[NSNotificationCenter defaultCenter] addObserver:self
                                            selector:@selector(itemDidPlayToEndTime:)
                                                name:AVPlayerItemDidPlayToEndTimeNotification
-                                             object:item];
+                                            object:item];
+    
+    // Observer for playback failure
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(itemFailedToPlayToEndTime:)
+                                                 name:AVPlayerItemFailedToPlayToEndTimeNotification
+                                               object:item];
+    
+    // Observer for playback stall (buffering)
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(itemPlaybackStalled:)
+                                                 name:AVPlayerItemPlaybackStalledNotification
+                                               object:item];
 }
 
 - (void)itemDidPlayToEndTime:(NSNotification *)notification {
@@ -197,6 +226,17 @@ static void *rateContext = &rateContext;
     }
   }
 }
+
+- (void)itemFailedToPlayToEndTime:(NSNotification *)notification {
+    // Handle error (e.g., show an alert to the user)
+    NSError *error = notification.userInfo[AVPlayerItemFailedToPlayToEndTimeErrorKey];
+}
+
+- (void)itemPlaybackStalled:(NSNotification *)notification {
+//    _player.rate = 0.0;
+    // Handle logic for when playback is stalled (e.g., show a loading spinner)
+}
+
 
 const int64_t TIME_UNSET = -9223372036854775807;
 
@@ -278,8 +318,14 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   }
   AVURLAsset *urlAsset = [AVURLAsset URLAssetWithURL:videoURL options:options];
   _totalBufferedTime = 0;
-  _videoData = [[NSMutableData alloc] initWithCapacity:1000000];
+  _minBuffer = 10;
+  _maxBuffer = 60;
+    _videoData = [NSMutableData data];
+//  _videoData = [[NSMutableData alloc] initWithCapacity:1000000];
   _pendingRequests = [NSMutableArray array];
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+
   [urlAsset.resourceLoader setDelegate:self queue:dispatch_get_main_queue()];
 
   AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:urlAsset];
@@ -332,12 +378,8 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 
   _player = [avFactory playerWithPlayerItem:item];
   _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-
-  // set buffer to 3 seconds
-  // after testing, this setting does not prevent avplayer from buffering 2 minutes ahead, we need only  a few seconds
-  // NSTimeInterval interval = 1; // set to  0 for default duration.
-  // _player.currentItem.preferredForwardBufferDuration = interval;
-  // _player.automaticallyWaitsToMinimizeStalling = YES;
+  _player.automaticallyWaitsToMinimizeStalling = NO;
+  // item.preferredForwardBufferDuration = 1.0;
 
   // This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
   // (https://github.com/flutter/flutter/issues/111457) and 2. swapped width and height for some
@@ -365,7 +407,6 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
                                   repeats:YES];
 
   [asset loadValuesAsynchronouslyForKeys:@[ @"tracks" ] completionHandler:assetCompletionHandler];
-
   return self;
 }
 
@@ -374,8 +415,8 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
     NSInteger loadStart = loadingRequest.dataRequest.requestedOffset;
     NSInteger loadEnd = loadingRequest.dataRequest.requestedLength == 2 ? 1 : loadStart + 1000000;
     [request setValue:[NSString stringWithFormat:@"bytes=%ld-%ld", (long)loadStart, (long)loadEnd] forHTTPHeaderField:@"Range"];
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+//    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+//    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
     self.dataTask = [self.session dataTaskWithRequest:request];
     [self.dataTask resume];
     [self.pendingRequests addObject:loadingRequest];
@@ -387,6 +428,7 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 didReceiveResponse:(NSURLResponse *)response
  completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
     self.responset = (NSHTTPURLResponse *) response;
+    _videoData = [NSMutableData data];
     completionHandler(NSURLSessionResponseAllow);
 
 }
@@ -394,8 +436,43 @@ didReceiveResponse:(NSURLResponse *)response
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
+//      [NSThread sleepForTimeInterval:2.0f]; // simulate slow download bandwidth
     [self.videoData appendData:data];
 }
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    if (error) {
+           // Error occurred
+           
+           // To print the full error details (including error code and domain)
+           
+           // Optional: Check for specific error codes and handle them accordingly
+           if (error.code == NSURLErrorNotConnectedToInternet) {
+           } else if (error.code == NSURLErrorTimedOut) {
+           }
+       } else {
+           // No error, task completed successfully
+           [self flushBuffer];
+       }
+}
+
+// NSURLSession delegate method for handling failures
+- (void)URLSession:(NSURLSession *)session
+               task:(NSURLSessionTask *)task
+ didFailWithError:(NSError *)error {
+    
+    // Handle specific errors
+    if (error.code == NSURLErrorNotConnectedToInternet) {
+    } else if (error.code == NSURLErrorTimedOut) {
+    } else {
+    }
+
+    // You can also handle the error gracefully by notifying the user, retrying the request, etc.
+}
+
+
 
 - (void)resourceLoader:(AVAssetResourceLoader *)resourceLoader didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
     [self.pendingRequests removeObject:loadingRequest];
@@ -456,6 +533,7 @@ didReceiveResponse:(NSURLResponse *)response
         _eventSink(@{@"event" : @"bufferingStart"});
       }
     }
+    
   } else if (context == rateContext) {
     // Important: Make sure to cast the object to AVPlayer when observing the rate property,
     // as it is not available in AVPlayerItem.
@@ -464,15 +542,34 @@ didReceiveResponse:(NSURLResponse *)response
       _eventSink(
           @{@"event" : @"isPlayingStateUpdate", @"isPlaying" : player.rate > 0 ? @YES : @NO});
     }
+  } else if (context == isPlaybackBufferEmptyContext) {
+    AVPlayer *player = (AVPlayer *)object;
+    if (_eventSink != nil) {
+      _eventSink(@{@"event" : @"isPlaybackBufferEmpty"});
+    }
+  } else if (context == isPlaybackBufferFullContext) {
+    AVPlayer *player = (AVPlayer *)object;
+    if (_eventSink != nil) {
+      _eventSink(@{@"event" : @"isPlaybackBufferFull"});
+    }
   }
 }
 
-- (void)flushBuffer {    
-        if (_totalBufferedTime != _totalBufferedTime) _totalBufferedTime = 0;
+- (void)flushBuffer {
+        if (isnan(CMTimeGetSeconds(_player.currentTime))) return;
+        if (isnan(_totalBufferedTime)) _totalBufferedTime = 0;
+        // if (_totalBufferedTime != _totalBufferedTime) _totalBufferedTime = 0;
         Float64 remainingBuffer = _totalBufferedTime - CMTimeGetSeconds(_player.currentTime);
-        if (self.dataTask.state == NSURLSessionTaskStateCompleted && remainingBuffer < 10) {
-          [self processPendingRequests];
-        }  
+        if (remainingBuffer <= _minBuffer && _player.rate == 1.0 ) {
+            _player.rate = 0.0;            
+        } else if (remainingBuffer > _minBuffer && _player.rate == 0.0 ) {
+            _player.rate = 1.0;            
+        }
+        if (self.dataTask.state == NSURLSessionTaskStateCompleted) {
+          if (remainingBuffer < _maxBuffer) {
+            [self processPendingRequests];          
+          }  
+        }
 }
 
 - (void)processPendingRequests {
@@ -483,17 +580,21 @@ didReceiveResponse:(NSURLResponse *)response
             loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
             loadingRequest.contentInformationRequest.contentLength = self.contentLength;
             loadingRequest.contentInformationRequest.contentType = @"video/mp4";
-            [loadingRequest.dataRequest respondWithData:self.videoData];
-            [loadingRequest finishLoading];
-            [requestsCompleted addObject:loadingRequest];
-            [self.videoData initWithCapacity:self.contentLength];
+//            [loadingRequest.dataRequest respondWithData:self.videoData];
+//            [loadingRequest finishLoading];
+//            [requestsCompleted addObject:loadingRequest];
+//            [self.videoData initWithCapacity:self.contentLength];
         } else {
-            [loadingRequest.dataRequest respondWithData:self.videoData];
-            [loadingRequest finishLoading];
-            [requestsCompleted addObject:loadingRequest];
-            [self.videoData initWithCapacity:self.contentLength];
+//            [loadingRequest.dataRequest respondWithData:self.videoData];
+//            [loadingRequest finishLoading];
+//            [requestsCompleted addObject:loadingRequest];
+//            [self.videoData initWithCapacity:self.contentLength];
         }
+        [loadingRequest.dataRequest respondWithData:self.videoData];
+        [loadingRequest finishLoading];
+        [requestsCompleted addObject:loadingRequest];
     }
+    
     [self.pendingRequests removeObjectsInArray:requestsCompleted];
 }
 
@@ -748,6 +849,8 @@ didReceiveResponse:(NSURLResponse *)response
 
   [self.player replaceCurrentItemWithPlayerItem:nil];
   [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self.session invalidateAndCancel];
+    self.session = nil;
 }
 
 - (void)dispose {
@@ -779,6 +882,8 @@ didReceiveResponse:(NSURLResponse *)response
   [currentItem removeObserver:self forKeyPath:@"presentationSize"];
   [currentItem removeObserver:self forKeyPath:@"duration"];
   [currentItem removeObserver:self forKeyPath:@"playbackLikelyToKeepUp"];
+  [currentItem removeObserver:self forKeyPath:@"isPlaybackBufferEmpty"];
+  [currentItem removeObserver:self forKeyPath:@"isPlaybackBufferFull"];
   [_player removeObserver:self forKeyPath:@"rate"];
 }
 
